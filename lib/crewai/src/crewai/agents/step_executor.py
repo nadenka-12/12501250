@@ -554,7 +554,8 @@ class StepExecutor:
         """Execute step using native function calling with a multi-turn loop.
 
         Iterates LLM call → tool execution → appended results until the LLM
-        returns a text answer (no more tool calls) or max_step_iterations is
+        returns a text answer (no more tool calls), a tool marked
+        result_as_answer finishes the step, or max_step_iterations is
         reached.  This lets the agent run a shell command, observe the output,
         correct mistakes, and issue follow-up commands — all within one step.
         """
@@ -586,9 +587,11 @@ class StepExecutor:
                 return answer.model_dump_json()
 
             if isinstance(answer, list) and answer and is_tool_call_list(answer):
-                result = self._execute_native_tool_calls(
+                result, final_answer = self._execute_native_tool_calls(
                     answer, messages, todo, tool_calls_made
                 )
+                if final_answer is not None:
+                    return final_answer
                 accumulated_results.append(result)
                 continue
 
@@ -607,17 +610,21 @@ class StepExecutor:
         messages: list[LLMMessage],
         todo: TodoItem,
         tool_calls_made: list[str],
-    ) -> str:
-        """Execute a batch of native tool calls and return their results.
+    ) -> tuple[str, str | None]:
+        """Execute a batch of native tool calls and append their tool messages.
 
-        Returns the result of the first tool marked result_as_answer if any,
-        otherwise returns all tool results concatenated.
+        Returns a ``(results, final_answer)`` tuple: the concatenated tool
+        results and, when a tool in the batch is marked result_as_answer,
+        that tool's result for the caller to return as the step's final
+        answer (None otherwise). Every declared tool call is answered with a
+        tool message so the history never carries dangling tool_call_ids.
         """
         assistant_message, _reports = build_tool_calls_assistant_message(tool_calls)
         if assistant_message:
             messages.append(assistant_message)
 
         tool_results: list[str] = []
+        final_answer: str | None = None
         for tool_call in tool_calls:
             call_result = execute_single_native_tool_call(
                 tool_call,
@@ -637,9 +644,6 @@ class StepExecutor:
 
             if call_result.func_name:
                 tool_calls_made.append(call_result.func_name)
-
-            if call_result.result_as_answer:
-                return str(call_result.result)
 
             if call_result.tool_message:
                 raw_content = call_result.tool_message.get("content", "")
@@ -669,4 +673,7 @@ class StepExecutor:
                     if raw_content:
                         tool_results.append(str(raw_content))
 
-        return "\n".join(tool_results) if tool_results else ""
+            if call_result.result_as_answer and final_answer is None:
+                final_answer = str(call_result.result)
+
+        return ("\n".join(tool_results) if tool_results else ""), final_answer
