@@ -541,13 +541,25 @@ def test_anthropic_model_detection():
         ("anthropic/claude-3", True),
         ("claude-instant", True),
         ("claude/v1", True),
+        ("anthropic--claude-sonnet-custom", True),
+        ("anthropic:claude-sonnet-custom", True),
+        ("anthropic.claude-sonnet-v1:0", True),
+        ("claude--custom", True),
         ("gpt-4", False),
         ("anthropomorphic", False),
     ]
 
     for model, expected in models:
-        llm = LLM(model=model, is_litellm=True)
-        assert llm.is_anthropic == expected, f"Failed for model: {model}"
+        assert LLM._is_anthropic_model(model) == expected, f"Failed for model: {model}"
+
+    with (
+        patch("crewai.llm._ensure_litellm", return_value=True),
+        patch("crewai.llm.litellm", MagicMock()),
+    ):
+        assert (
+            LLM(model="anthropic--claude-sonnet-custom", is_litellm=True).is_anthropic
+            is True
+        )
 
 
 def test_anthropic_message_formatting(anthropic_llm, system_message, user_message):
@@ -1269,6 +1281,10 @@ def test_validate_model_in_constants():
     assert LLM._validate_model_in_constants("claude-sonnet-4-6", "claude") is True
     assert LLM._validate_model_in_constants("claude-future-5", "claude") is True
     assert LLM._validate_model_in_constants("claude-haiku-4-5", "claude") is True
+    assert (
+        LLM._validate_model_in_constants("anthropic--claude-custom", "anthropic")
+        is True
+    )
     assert LLM._validate_model_in_constants("unknown-model", "claude") is False
 
     # Gemini models
