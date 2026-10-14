@@ -8,7 +8,7 @@ from typing import Any, Literal, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ImportString
 
 from crewai.hooks.tool_hooks import (
     ToolCallHookContext,
@@ -1798,3 +1798,379 @@ class TestHandleMaxIterationsExceeded:
             )
         else:
             printer.print.assert_not_called()
+
+class TestModuleAllowlist:
+    """Tests for the tool module allowlist in load_agent_from_repository."""
+
+    def test_is_allowlisted_tool_module_exact_members(self):
+        """Exact allowlist members pass; anything else falls through to the package check."""
+        from crewai.utilities.agent_utils import _is_allowlisted_tool_module
+
+        assert _is_allowlisted_tool_module("crewai.tools") is True
+        assert _is_allowlisted_tool_module("crewai_tools") is True
+        assert _is_allowlisted_tool_module("crewai.tools.base_tool") is True
+        assert _is_allowlisted_tool_module("os") is False
+        assert _is_allowlisted_tool_module("subprocess") is False
+        # A loose prefix match must not bless lookalike top-level names.
+        assert _is_allowlisted_tool_module("crewai_tools_evil") is False
+
+    def test_crewai_tools_submodule_inside_package_is_allowed(self):
+        """A repository record's defining module (e.g. csv_search_tool's own
+        submodule) resolves inside the installed crewai_tools package."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from crewai.utilities import agent_utils
+
+        def fake_find_spec(name):
+            if name == "crewai_tools":
+                return SimpleNamespace(submodule_search_locations=["/site/crewai_tools"])
+            if name == "crewai_tools.tools.csv_search_tool.csv_search_tool":
+                return SimpleNamespace(
+                    origin="/site/crewai_tools/tools/csv_search_tool/csv_search_tool.py"
+                )
+            raise AssertionError(f"unexpected find_spec({name})")
+
+        with patch.object(
+            agent_utils.importlib.util, "find_spec", side_effect=fake_find_spec
+        ):
+            assert (
+                agent_utils._is_allowlisted_tool_module(
+                    "crewai_tools.tools.csv_search_tool.csv_search_tool"
+                )
+                is True
+            )
+
+    def test_crewai_tools_submodule_outside_package_is_rejected(self):
+        """A dotted name under crewai_tools.* that resolves outside the installed
+        package directory is still rejected."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from crewai.utilities import agent_utils
+
+        def fake_find_spec(name):
+            if name == "crewai_tools":
+                return SimpleNamespace(submodule_search_locations=["/site/crewai_tools"])
+            return SimpleNamespace(origin="/tmp/attacker/x.py")
+
+        with patch.object(
+            agent_utils.importlib.util, "find_spec", side_effect=fake_find_spec
+        ):
+            assert (
+                agent_utils._is_allowlisted_tool_module("crewai_tools.tools.evil")
+                is False
+            )
+
+    def test_crewai_tools_submodule_unresolvable_is_rejected(self):
+        """A submodule find_spec cannot resolve is rejected."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from crewai.utilities import agent_utils
+
+        def fake_find_spec(name):
+            if name == "crewai_tools":
+                return SimpleNamespace(submodule_search_locations=["/site/crewai_tools"])
+            return None
+
+        with patch.object(
+            agent_utils.importlib.util, "find_spec", side_effect=fake_find_spec
+        ):
+            assert (
+                agent_utils._is_allowlisted_tool_module("crewai_tools.tools.missing")
+                is False
+            )
+
+    def test_crewai_tools_package_missing_is_rejected(self):
+        """Without an installed crewai_tools package, submodules are rejected."""
+        from unittest.mock import patch
+
+        from crewai.utilities import agent_utils
+
+        with patch.object(
+            agent_utils.importlib.util, "find_spec", return_value=None
+        ):
+            assert (
+                agent_utils._is_allowlisted_tool_module(
+                    "crewai_tools.tools.csv_search_tool.csv_search_tool"
+                )
+                is False
+            )
+
+    def test_blocked_module_raises_repository_error(self):
+        """Loading an agent whose tool references a non-allowlisted module should raise AgentRepositoryError."""
+        from unittest.mock import MagicMock, patch
+
+        from crewai.utilities.errors import AgentRepositoryError
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "name": "test-agent",
+            "tools": [
+                {
+                    "module": "os",
+                    "name": "system",
+                    "init_params": {},
+                }
+            ],
+        }
+
+        with (
+            patch("crewai.utilities.agent_utils.resolve_plus_response", return_value=mock_response),
+            patch("crewai.utilities.agent_utils.resolve_plus_client"),
+        ):
+            from crewai.utilities.agent_utils import load_agent_from_repository
+
+            with pytest.raises(AgentRepositoryError, match="not in the allowlist"):
+                load_agent_from_repository("test-agent")
+
+    def test_non_basetool_attribute_raises_repository_error(self):
+        """A tool name resolving to a non-BaseTool attribute should raise AgentRepositoryError."""
+        from unittest.mock import MagicMock, patch
+
+        from crewai.utilities.errors import AgentRepositoryError
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "name": "test-agent",
+            "tools": [
+                {
+                    "module": "crewai.tools",
+                    "name": "ToolExecutionFailedError",  # exception class, not a tool
+                    "init_params": {},
+                }
+            ],
+        }
+
+        with (
+            patch("crewai.utilities.agent_utils.resolve_plus_response", return_value=mock_response),
+            patch("crewai.utilities.agent_utils.resolve_plus_client"),
+        ):
+            from crewai.utilities.agent_utils import load_agent_from_repository
+
+            with pytest.raises(AgentRepositoryError, match="not a BaseTool subclass"):
+                load_agent_from_repository("test-agent")
+
+    def test_allowlisted_basetool_instantiation_succeeds(self):
+        """An allowlisted module + BaseTool subclass should pass the guard and instantiate."""
+        from unittest.mock import MagicMock, patch
+
+        class RepositoryTestTool(BaseTool):
+            name: str = "repository_test_tool"
+            description: str = "Loads from the repository for testing."
+
+            def _run(self, *args, **kwargs):
+                return "ok"
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "name": "test-agent",
+            "tools": [
+                {
+                    "module": "crewai.tools",
+                    "name": "tool",
+                    "init_params": {},
+                }
+            ],
+        }
+
+        with (
+            patch("crewai.utilities.agent_utils.resolve_plus_response", return_value=mock_response),
+            patch("crewai.utilities.agent_utils.resolve_plus_client"),
+            patch("crewai.tools.tool", RepositoryTestTool),
+        ):
+            from crewai.utilities.agent_utils import load_agent_from_repository
+
+            result = load_agent_from_repository("test-agent")
+            assert result.get("name") == "test-agent"
+
+    def test_agent_without_tools_loads_successfully(self):
+        """An agent with no tools should load without tool-module validation."""
+        from unittest.mock import MagicMock, patch
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "name": "test-agent",
+            "tools": [],
+        }
+
+        with (
+            patch("crewai.utilities.agent_utils.resolve_plus_response", return_value=mock_response),
+            patch("crewai.utilities.agent_utils.resolve_plus_client"),
+        ):
+            from crewai.utilities.agent_utils import load_agent_from_repository
+
+            result = load_agent_from_repository("test-agent")
+            assert result.get("name") == "test-agent"
+
+
+class TestRepositoryToolParamValidation:
+    """Tests for init_params validation in load_agent_from_repository.
+
+    The module allowlist gates *which* tool classes may load; init_params
+    validation gates *what* a remote record may pass to their constructors.
+    """
+
+    @staticmethod
+    def _repository_response(tools):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"name": "test-agent", "tools": tools}
+        return mock_response
+
+    @staticmethod
+    def _load_with_tool(mock_response, tool_class):
+        with (
+            patch(
+                "crewai.utilities.agent_utils.resolve_plus_response",
+                return_value=mock_response,
+            ),
+            patch("crewai.utilities.agent_utils.resolve_plus_client"),
+            patch("crewai.tools.tool", tool_class),
+        ):
+            from crewai.utilities.agent_utils import load_agent_from_repository
+
+            return load_agent_from_repository("test-agent")
+
+    def test_import_string_param_rejected(self):
+        """A string init_param for an ImportString field must be rejected:
+        pydantic would import the dotted path as a live callable on this host
+        (e.g. 'os.system'), which the tool may then invoke."""
+        from crewai.utilities.errors import AgentRepositoryError
+
+        class ImportStringTool(BaseTool):
+            name: str = "import_string_tool"
+            description: str = "Tool with an import-resolving init param."
+            custom_embedding_fn: ImportString
+
+            def _run(self, *args, **kwargs):
+                return "ok"
+
+        response = self._repository_response(
+            [
+                {
+                    "module": "crewai.tools",
+                    "name": "tool",
+                    "init_params": {"custom_embedding_fn": "os.system"},
+                }
+            ]
+        )
+        with pytest.raises(AgentRepositoryError, match="import-resolving"):
+            self._load_with_tool(response, ImportStringTool)
+
+    def test_optional_import_string_param_rejected(self):
+        """Optional[ImportString] (and other wrappers) must be caught too."""
+        from crewai.utilities.errors import AgentRepositoryError
+
+        class OptionalImportStringTool(BaseTool):
+            name: str = "optional_import_string_tool"
+            description: str = "Tool with an optional import-resolving param."
+            custom_embedding_fn: ImportString | None = None
+
+            def _run(self, *args, **kwargs):
+                return "ok"
+
+        response = self._repository_response(
+            [
+                {
+                    "module": "crewai.tools",
+                    "name": "tool",
+                    "init_params": {"custom_embedding_fn": "builtins.eval"},
+                }
+            ]
+        )
+        with pytest.raises(AgentRepositoryError, match="import-resolving"):
+            self._load_with_tool(response, OptionalImportStringTool)
+
+    def test_undeclared_param_rejected(self):
+        """Records may not smuggle unexpected keyword arguments into the tool
+        constructor."""
+        from crewai.utilities.errors import AgentRepositoryError
+
+        class ScalarTool(BaseTool):
+            name: str = "scalar_tool"
+            description: str = "Tool with a plain scalar param."
+            top_k: int = 5
+
+            def _run(self, *args, **kwargs):
+                return "ok"
+
+        response = self._repository_response(
+            [
+                {
+                    "module": "crewai.tools",
+                    "name": "tool",
+                    "init_params": {"top_k": 3, "no_such_field": 1},
+                }
+            ]
+        )
+        with pytest.raises(AgentRepositoryError, match="does not declare"):
+            self._load_with_tool(response, ScalarTool)
+
+    def test_non_dict_init_params_rejected(self):
+        """init_params must be a JSON object."""
+        from crewai.utilities.errors import AgentRepositoryError
+
+        class ScalarTool(BaseTool):
+            name: str = "scalar_tool"
+            description: str = "Tool with a plain scalar param."
+            top_k: int = 5
+
+            def _run(self, *args, **kwargs):
+                return "ok"
+
+        response = self._repository_response(
+            [
+                {
+                    "module": "crewai.tools",
+                    "name": "tool",
+                    "init_params": ["top_k"],
+                }
+            ]
+        )
+        with pytest.raises(AgentRepositoryError, match="expected a JSON object"):
+            self._load_with_tool(response, ScalarTool)
+
+    def test_non_json_value_rejected(self):
+        """Non-serializable values (notably callables) must never reach the
+        tool constructor."""
+        from crewai.utilities.agent_utils import _validate_repository_tool_params
+        from crewai.utilities.errors import AgentRepositoryError
+
+        class ScalarTool(BaseTool):
+            name: str = "scalar_tool"
+            description: str = "Tool with a plain scalar param."
+            top_k: int = 5
+
+            def _run(self, *args, **kwargs):
+                return "ok"
+
+        with pytest.raises(AgentRepositoryError, match="must be JSON-typed"):
+            _validate_repository_tool_params(ScalarTool, {"top_k": object()})
+
+    def test_scalar_params_still_instantiate(self):
+        """Legitimate JSON scalar params for declared fields keep working."""
+        class ScalarTool(BaseTool):
+            name: str = "scalar_tool"
+            description: str = "Tool with a plain scalar param."
+            top_k: int = 5
+
+            def _run(self, *args, **kwargs):
+                return "ok"
+
+        response = self._repository_response(
+            [
+                {
+                    "module": "crewai.tools",
+                    "name": "tool",
+                    "init_params": {"top_k": 3},
+                }
+            ]
+        )
+        result = self._load_with_tool(response, ScalarTool)
+        assert result["tools"][0].top_k == 3
